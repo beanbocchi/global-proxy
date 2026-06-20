@@ -1,4 +1,3 @@
-// Package sse fans bus events out to connected server-sent-event clients.
 package main
 
 import (
@@ -15,12 +14,12 @@ import (
 )
 
 const (
-	clientBuffer = 16               // per-client queue; full => event dropped for that client
-	heartbeat    = 25 * time.Second // keepalive comment so idle conns/proxies stay open
+	sseClientBuffer = 16               // per-client queue; full => event dropped for that client
+	sseHeartbeat    = 25 * time.Second // keepalive comment so idle conns/proxies stay open
 )
 
-// client is one connected SSE stream.
-type client struct {
+// sseClient is one connected SSE stream: a queue drained by its own Serve loop.
+type sseClient struct {
 	recipient string
 	ch        chan model.SSEMsg
 }
@@ -29,16 +28,18 @@ type client struct {
 // client that can't keep up drops events rather than stalling the bus.
 type SSEHub struct {
 	mu      sync.RWMutex
-	clients map[*client]struct{}
+	clients map[*sseClient]struct{}
 	seq     atomic.Uint64
 }
 
 func NewSSEHub() *SSEHub {
-	return &SSEHub{clients: make(map[*client]struct{})}
+	return &SSEHub{clients: make(map[*sseClient]struct{})}
 }
 
-// Dispatch is the bus handler: it routes one event to every matching client.
-// A recipient targets one user's streams; empty broadcasts to all.
+// Dispatch is the bus handler: it routes one event to every matching client
+// (recipient targets one user's streams; empty broadcasts to all). The send is
+// non-blocking — a client whose buffer is full drops the event rather than
+// stalling the bus.
 func (h *SSEHub) Dispatch(_ context.Context, e model.SSEMsg) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -72,7 +73,7 @@ func (h *SSEHub) Serve(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	ticker := time.NewTicker(heartbeat)
+	ticker := time.NewTicker(sseHeartbeat)
 	defer ticker.Stop()
 	for {
 		select {
@@ -99,15 +100,15 @@ func (h *SSEHub) writeMsg(w io.Writer, e model.SSEMsg) {
 	_, _ = fmt.Fprintf(w, "id:%d\ndata:%s\n\n", h.seq.Add(1), data)
 }
 
-func (h *SSEHub) add(recipient string) *client {
-	c := &client{recipient: recipient, ch: make(chan model.SSEMsg, clientBuffer)}
+func (h *SSEHub) add(recipient string) *sseClient {
+	c := &sseClient{recipient: recipient, ch: make(chan model.SSEMsg, sseClientBuffer)}
 	h.mu.Lock()
 	h.clients[c] = struct{}{}
 	h.mu.Unlock()
 	return c
 }
 
-func (h *SSEHub) remove(c *client) {
+func (h *SSEHub) remove(c *sseClient) {
 	h.mu.Lock()
 	delete(h.clients, c)
 	h.mu.Unlock()
