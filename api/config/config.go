@@ -17,8 +17,16 @@ type Config struct {
 	Port      string    `mapstructure:"port" validate:"required,numeric"`
 	Log       Log       `mapstructure:"log"`
 	PostgREST  PostgREST  `mapstructure:"postgrest"`  // global data over HTTP (no direct DB)
+	Upstreams  Upstreams  `mapstructure:"upstreams"`  // extra reverse-proxy targets (gateway = Kong)
 	Nats       Nats       `mapstructure:"nats"`       // event bus (JetStream)
 	ClickHouse ClickHouse `mapstructure:"clickhouse"` // analytics sink (the worker)
+}
+
+// Upstreams are the non-PostgREST targets the gateway reverse-proxies, replacing
+// Kong's service routes for what this stack actually runs. Empty => route off.
+type Upstreams struct {
+	Meta   string `mapstructure:"meta"`   // postgres-meta — /pg/* (Studio schema browse)
+	Studio string `mapstructure:"studio"` // dashboard UI — "/" catch-all
 }
 
 // ClickHouse is the analytics store — only the worker's usage sink connects to it.

@@ -56,6 +56,7 @@ flowchart TD
 
     Mux -->|"GET /health"| Health["200 {status:ok}"]
     Mux -->|"POST /jobs"| H["bus.Publish → NATS"]
+    Mux -->|"GET /sse"| SSE["SSE stream<br/>(bus TopicSSE → clients)"]
     Mux -->|"/rest/v1/*"| Proxy["ReverseProxy<br/>strip prefix + inject anon"]
 
     Proxy --> BT["guard.Transport<br/>per-host breaker + bulkhead"]
@@ -118,7 +119,7 @@ into node `/new`, P11 / R-F4):
 
 ```mermaid
 flowchart TD
-    In["RoundTrip(req)"] --> Host["hosts.get(req.URL.Host)<br/>(per-key registry)"]
+    In["RoundTrip(req)"] --> Host["hosts.Get(req.URL.Host)<br/>(per-host LRU, pkg/memo)"]
     Host --> Slot{"bulkhead slot free?"}
     Slot -->|"no"| Over["ErrOverloaded"]
     Slot -->|"yes (hold slot)"| CB{"breaker.allow()?"}
@@ -151,8 +152,9 @@ flowchart TD
 
 Same `pkg/guard`, other direction. Outbound protects us from a dead **downstream**;
 inbound protects us from an abusive **client**. Both share one generic per-key
-`registry[T]` — outbound keys a breaker+bulkhead by host, inbound keys a token
-bucket by client. The inbound side is a `Middleware` chain (`guard.Chain`):
+cache — `memo.Cache[K,V]` (`pkg/memo`), a lazy-build LRU — outbound keys a
+breaker+bulkhead by host, inbound keys a token bucket by client. The inbound side
+is a `Middleware` chain (`guard.Chain`):
 
 ```mermaid
 flowchart TD
@@ -164,8 +166,8 @@ flowchart TD
     Tok -->|"no"| E429["429 {error: rate limited}"]
 ```
 
-- **`RateLimitConfig{RPS, Burst, Key}`** — `Key` picks the bucket dimension (IP now;
-  API key / user later, via a `KeyFunc`).
+- **`RateLimitConfig{RPS, Burst, Key, MaxKeys}`** — `Key` picks the bucket dimension
+  (IP now; API key / user later, via a `KeyFunc`); `MaxKeys` caps distinct buckets (LRU).
 - **Whitelist = `Allowlist(match)`** — a matching request is marked **trusted** in
   its `context`, skipping **all** guard: the inbound rate limit *and* the outbound
   breaker/bulkhead (`Transport.RoundTrip` reads `trusted(ctx)`; the ctx flows
@@ -178,9 +180,33 @@ flowchart TD
 - Token bucket via `golang.org/x/time/rate`: `Burst` absorbs spikes, `RPS` is the
   sustained rate; over-limit ⇒ **429** (distinct from the outbound 503).
 
-> Known gap: the per-key registry never evicts, so a flood of unique client keys
-> (spoofed IPs) grows the map unbounded — itself a DoS vector. Add TTL/LRU eviction
-> (or an upstream WAF/IP allowlist) before exposing this to the open internet.
+- **Bounded keyspace:** the per-key cache is an LRU (`memo.Cache`), capped by
+  `MaxKeys` (rate buckets, default 10k) / `MaxHosts` (breakers, default 1k), so a
+  flood of unique keys (spoofed IPs / attacker `Host`) evicts the least-recently-used
+  instead of growing the map unbounded. Still pair with an upstream WAF/IP allowlist
+  before exposing to the open internet.
+
+### 2.6 Live events (SSE broadcast)
+
+`GET /sse` is a server-sent-event stream. The gateway subscribes the bus topic
+`TopicSSE` once (`SSEHub.Dispatch`) and fans each message out to the connected
+clients it matches — `SSEMsg.Recipient` targets one user's streams, empty
+broadcasts to all. Producers publish typed events to the bus from anywhere:
+
+```go
+bus.Publish(ctx, busClient, model.TopicSSE,
+    model.SSEMsg{Type: model.SSENotification, Recipient: "user@x", Data: payload})
+```
+
+- **Typed kinds:** `SSEType` consts (`SSENotification`, …) + a payload struct per
+  kind, so producers/consumers aren't stringly-typed.
+- **Per-client fan-out:** each connection holds a buffered channel; `Dispatch`
+  does a non-blocking send, so a slow client **drops** events rather than stalling
+  the bus (live, best-effort). Wire format + headers per TDD §2.4.1
+  (`text/event-stream`, `Cache-Control: no-store`, 25s keepalive).
+- **Known gaps:** recipient comes from `?user=` (TODO: derive from auth, not the
+  client); one fixed consumer group is correct for a single gateway — multi-replica
+  needs a unique group per process so every replica gets a copy.
 
 ---
 
@@ -190,7 +216,8 @@ The gateway **publishes** to the bus and fast-returns; the worker subscribes,
 registers, and executes. The full flow is **§3.1** below (this is what the code does).
 
 - **Model** (`shared/model`): `TopicJob = bus.NewTopic[JobMsg]("jobs")` + `JobMsg` (carries the idempotency `id`);
-  `TopicUsage = bus.NewTopic[UsageEvent]("usage.snapshot")` for the analytics sink.
+  `TopicUsage = bus.NewTopic[UsageMsg]("usage.snapshot")` for the analytics sink;
+  `TopicSSE = bus.NewTopic[SSEMsg]("sse")` for the live event stream (§2.6).
 - **Bus** (`pkg/bus`): type-safe pub/sub with **per-message ack** (`Handler` returns `[]error`); `nats` (JetStream) in prod, `memory` for tests.
 
 ### 3.1 Target flow — gateway publishes, worker runs at most once
@@ -266,7 +293,10 @@ table:
 ## 4. Worker
 
 A thin loop: subscribe to `TopicJob` → `idem.Run(id, fn)` → the guard registers,
-runs the side-effect, and records the outcome. Full flow in §3.1.
+runs the side-effect, and records the outcome. Full flow in §3.1. The worker also
+subscribes `TopicUsage` and batch-INSERTs usage into ClickHouse (`SubscribeBatch` +
+`WithConcurrency(1)` for serial inserts) — the analytics sink, folded in here
+rather than a separate binary.
 
 **Idempotency** (`pkg/idempotency`): a `Guard` over a `Store` interface — backends
 `PostgrestStore` (durable, prod) and `MemStore` (tests). `Guard.Run` is the

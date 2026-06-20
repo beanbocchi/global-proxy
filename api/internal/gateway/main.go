@@ -51,7 +51,7 @@ func Run() error {
 	bus.Subscribe(eventBus, model.TopicSSE, "gateway-sse", hub.Dispatch)
 
 	h := handler.NewHandler(eventBus)
-	srv := &http.Server{Addr: ":" + cfg.Port, Handler: newMux(h, hub, cfg.PostgREST, bt)}
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: newMux(h, hub, cfg.PostgREST, cfg.Upstreams, bt)}
 
 	errCh := make(chan error, 1)
 	go func() {

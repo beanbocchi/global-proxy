@@ -24,7 +24,7 @@ var (
 
 // newMux builds the gateway router on the stdlib ServeMux (Go 1.22 method+path
 // patterns). rt is the circuit-breaking transport for the /rest/v1 proxy.
-func newMux(h *handler.Handler, hub *SSEHub, prCfg config.PostgREST, rt http.RoundTripper) http.Handler {
+func newMux(h *handler.Handler, hub *SSEHub, prCfg config.PostgREST, up config.Upstreams, rt http.RoundTripper) http.Handler {
 	mux := http.NewServeMux()
 
 	h.Route(mux)
@@ -32,8 +32,10 @@ func newMux(h *handler.Handler, hub *SSEHub, prCfg config.PostgREST, rt http.Rou
 	// Live event stream: clients subscribe here, the bus feeds hub.Dispatch.
 	mux.HandleFunc("GET /sse", hub.Serve)
 
-	// Supabase-compatible REST passthrough to PostgREST (P0-A).
+	// Supabase-compatible passthrough, replacing Kong's service routes:
+	//   /rest/v1/*, /graphql/v1 → PostgREST; /pg/* → postgres-meta; / → Studio.
 	registerRestProxy(mux, prCfg, rt)
+	registerUpstreams(mux, up, rt)
 
 	// Inbound guard chain (outermost first): deny blacklisted IPs → CORS/preflight
 	// → mark whitelisted IPs trusted → per-IP rate limit (skips trusted).
